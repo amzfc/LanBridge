@@ -12,9 +12,9 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            command: npm run dist:mac
+            command: npm run dist:mac -- --publish never
           - os: windows-latest
-            command: npm run dist:win
+            command: npm run dist:win -- --publish never
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
