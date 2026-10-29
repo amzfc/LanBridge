@@ -1,0 +1,60 @@
+name: Build and release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            command: npm run dist:mac
+          - os: windows-latest
+            command: npm run dist:win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: ${{ matrix.command }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LanBridge-${{ matrix.os }}
+          path: |
+            dist/*.zip
+            dist/*.exe
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: LanBridge-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          sha256sum LanBridge-*.zip LanBridge-*.exe > SHA256SUMS.txt
+          cd ..
+          if [ "${GITHUB_REF_NAME}" = "v0.1.0" ]; then
+            gh release create "${GITHUB_REF_NAME}" dist/LanBridge-*.zip dist/LanBridge-*.exe dist/SHA256SUMS.txt --title "邻传 ${GITHUB_REF_NAME}" --notes-file RELEASE_NOTES_0.1.0.md --prerelease
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/LanBridge-*.zip dist/LanBridge-*.exe dist/SHA256SUMS.txt --title "邻传 ${GITHUB_REF_NAME}" --generate-notes
+          fi

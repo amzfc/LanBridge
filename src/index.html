@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; connect-src 'none'; base-uri 'none'">
+<title>邻传</title><link rel="stylesheet" href="style.css"></head>
+<body><div class="shell">
+  <header><div class="brand"><div class="logo">↗</div><div><strong>邻传</strong><span>任意两台 Mac 或 Windows 电脑 · 局域网互传</span></div></div><div class="status-pill"><i></i> 已在局域网中待命</div></header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">PRIVATE FILE TRANSFER</p><h1>两台电脑，直接传。</h1><p>在另一台电脑上打开邻传，输入这里的 IP 和配对码。首次配对需要两端核对并确认。</p></div><div class="arrow-art"><span>电脑 A</span><b>↔</b><span>电脑 B</span></div></section>
+    <div class="grid">
+      <section class="card own"><div class="card-title"><div><h2>本机连接信息</h2><p>把这些信息告诉另一台电脑的使用者</p></div><span class="tag">1 · 配对</span></div><div class="ip-list" id="ip-list"></div><div class="code-row"><div><small>一次性配对码</small><strong id="pair-code">------</strong></div><button class="subtle" id="refresh-code">刷新配对码</button></div><p class="hint">配对码 10 分钟有效。两台电脑需连接同一局域网，系统防火墙需允许邻传访问。</p></section>
+      <section class="card connect"><div class="card-title"><div><h2>连接另一台电脑</h2><p>在一端输入另一端显示的 IP 和配对码</p></div><span class="tag">2 · 连接</span></div><label>对方的 IP 地址<input id="address" inputmode="decimal" placeholder="例如 192.168.1.23"></label><label>对方的六位配对码<input id="code" inputmode="numeric" maxlength="6" placeholder="请输入 6 位数字"></label><button class="primary" id="pair-button">发起配对 <span>→</span></button><p class="hint">连接后，双方会看到同一组校验码。请当面或通过可信方式核对，再点击确认。</p></section>
+    </div>
+    <section class="card" id="pair-requests-card"><div class="card-title"><div><h2>待确认的配对</h2><p>两边核对相同校验码后确认</p></div></div><div id="pair-requests" class="stack empty">目前没有配对请求</div></section>
+    <section class="card"><div class="card-title"><div><h2>已信任的电脑</h2><p>选中设备，再拖入文件或文件夹</p></div><span class="tag">3 · 发送</span></div><div id="peers" class="stack empty">尚未配对设备</div><div class="send-zone" id="drop-zone"><div class="send-icon">↑</div><strong>拖入文件或文件夹即可发送</strong><p>发送给上方选中的设备，接收方确认后开始传输</p><div class="send-actions"><button class="secondary" id="choose-files">选择文件</button><button class="secondary" id="choose-folder">选择文件夹</button></div></div></section>
+    <section class="card"><div class="card-title"><div><h2>传输任务</h2><p>接收请求需要手动确认</p></div></div><div id="transfers" class="stack empty">目前没有传输任务</div></section>
+    <section class="settings"><span>接收位置：<b id="download-dir"></b></span><button class="text-button" id="choose-download">更改</button><button class="text-button" id="open-download">打开文件夹</button></section>
+  </main>
+  <div id="toast" role="status" aria-live="polite"></div>
+</div><script src="renderer.js"></script></body></html>

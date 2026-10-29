@@ -1,0 +1,33 @@
+{
+  "name": "lanbridge",
+  "productName": "邻传",
+  "version": "0.1.0",
+  "description": "任意两台 Mac 或 Windows 电脑之间的加密局域网文件互传",
+  "author": "LanBridge",
+  "private": true,
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "pack": "electron-builder --dir",
+    "dist:mac": "electron-builder --mac zip --arm64 --x64",
+    "dist:win": "electron-builder --win portable --x64"
+  },
+  "dependencies": { "selfsigned": "5.5.0" },
+  "devDependencies": { "electron": "45.1.0", "electron-builder": "26.18.0" },
+  "build": {
+    "appId": "local.lanbridge.desktop",
+    "productName": "邻传",
+    "artifactName": "LanBridge-${version}-${os}-${arch}.${ext}",
+    "directories": { "output": "dist" },
+    "files": ["src/**/*", "package.json"],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.icns",
+      "identity": null,
+      "extendInfo": { "NSLocalNetworkUsageDescription": "邻传需要访问局域网，以发现可信电脑并直接传输文件。" }
+    },
+    "win": { "target": "portable", "icon": "build/icon.ico" }
+  }
+}
