@@ -9,4 +9,6 @@
 - HTTPS 直连传输，接收方逐次确认，SHA-256 校验文件。
 - 提供 Mac Apple Silicon、Mac Intel 和 Windows x64 安装包。
 
-已知限制：未在真实 Windows 设备上验证；不支持断点续传；仅支持局域网 IPv4；软件尚未签名。
+验证补充（2026-10-29）：用户反馈 Windows↔Mac、Windows↔Windows 实机可用；文件大小和速度尚未记录。
+
+已知限制：不支持断点续传；仅支持局域网 IPv4；软件尚未签名。

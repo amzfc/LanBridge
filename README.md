@@ -30,4 +30,4 @@ macOS 打包在 macOS 上运行，Windows 打包在 Windows 上运行。`.github
 
 ## 项目进度
 
-参见 [版本规划](ROADMAP.md)、[更新日志](CHANGELOG.md) 和 [安全说明](SECURITY.md)。v0.1.0 是预发布版本，Windows 实机验证尚待完成。
+参见 [版本规划](ROADMAP.md)、[更新日志](CHANGELOG.md) 和 [安全说明](SECURITY.md)。v0.1.0 是预发布版本。用户已在真实 Windows 电脑上验证 Windows↔Mac 和 Windows↔Windows 可用（2026-10-29）；文件大小及速度尚未记录。
