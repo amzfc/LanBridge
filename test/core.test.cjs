@@ -122,6 +122,19 @@ test('lost completion response is recoverable and cancelled partial transfers ar
     await a.init(); await b.init();
     await a.remember({ id: b.fingerprint, name: 'B', address: `127.0.0.1:${b.port}` });
     await b.remember({ id: a.fingerprint, name: 'A', address: `127.0.0.1:${a.port}` });
+    const route = b.route.bind(b);
+    b.route = async (req, res) => {
+      if (req.url === '/stall') return;
+      if (req.url === '/hash-heartbeat') {
+        const timer = setInterval(() => res.writeProcessing(), 20);
+        try { await pause(250); res.end('{}'); } finally { clearInterval(timer); }
+        return;
+      }
+      return route(req, res);
+    };
+    const address = `127.0.0.1:${b.port}`;
+    await assert.rejects(a.request(address, 'GET', '/stall', { pin: b.fingerprint, timeout: 100 }), /连接超时/);
+    assert.deepEqual(await a.request(address, 'GET', '/hash-heartbeat', { pin: b.fingerprint, timeout: 100 }), {});
     const file = path.join(root, 'data.txt'); await fs.writeFile(file, 'recover a lost acknowledgement');
     const request = a.request.bind(a);
     a.request = async (...args) => { const result = await request(...args); if (args[2].startsWith('/finish/')) throw new Error('模拟完成响应丢失'); return result; };

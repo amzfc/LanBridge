@@ -61,6 +61,11 @@ function send(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(json), 'Cache-Control': 'no-store' });
   res.end(json);
 }
+// Keep the socket alive while hashing large files; an actual network outage
+// still trips the client's inactivity timeout.
+function hashHeartbeat(res) {
+  return setInterval(() => { if (!res.destroyed) res.writeProcessing(); }, 5000);
+}
 function uniquePath(folder, name) {
   const parsed = path.parse(name);
   let out = path.join(folder, name); let index = 2;
@@ -329,6 +334,7 @@ class LanBridge {
       assert(entry && entry.type === 'file', '文件不在传输清单中');
       const file = path.join(t.temp, ...safeRel(entry.path));
       t.active = req;
+      const heartbeat = hashHeartbeat(res);
       try {
         let offset = 0; let exists = false;
         try { offset = (await fsp.stat(file)).size; exists = true; } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -336,7 +342,7 @@ class LanBridge {
         t.offsets ||= {};
         t.done += offset - (t.offsets[fileMatch[2]] || 0); t.offsets[fileMatch[2]] = offset;
         return send(res, 200, { offset, exists, hash: await fileHash(file, offset) });
-      } finally { t.active = null; }
+      } finally { clearInterval(heartbeat); t.active = null; }
     }
     if (req.method === 'PUT' && fileMatch) {
       const t = this.incoming.get(fileMatch[1]);
@@ -349,6 +355,7 @@ class LanBridge {
       assert(Number(req.headers['content-length']) === entry.size - offset, '文件大小与清单不符');
       const filePath = path.join(t.temp, ...safeRel(entry.path));
       t.active = req; t.status = 'receiving'; t.error = null;
+      const heartbeat = hashHeartbeat(res);
       try {
         await fsp.mkdir(path.dirname(filePath), { recursive: true });
         if (offset) assert((await fsp.stat(filePath)).size === offset, '续传位置已变化，请重试');
@@ -360,7 +367,7 @@ class LanBridge {
         t.received.add(i);
         return send(res, 200, { hash: await fileHash(filePath) });
       } catch (e) { if (t.status !== 'cancelled') { t.status = 'paused'; t.error = '连接中断，等待发送端继续'; } throw e; }
-      finally { t.active = null; this.persist(); this.emit(); }
+      finally { clearInterval(heartbeat); t.active = null; this.persist(); this.emit(); }
     }
     const finishMatch = url.pathname.match(/^\/finish\/([a-f0-9-]{36})$/);
     if (req.method === 'POST' && finishMatch) {
@@ -446,12 +453,12 @@ class LanBridge {
       for (const [i, entry] of t.entries.entries()) {
         if (entry.type !== 'file') continue;
         if (t.abort.signal.aborted) throw new Error('已取消');
-        const partial = await this.request(peer.address, 'GET', `/file/${t.remoteId}/${i}`, { ...options, timeout: 0 });
+        const partial = await this.request(peer.address, 'GET', `/file/${t.remoteId}/${i}`, { ...options, timeout: 30000 });
         assert(Number.isSafeInteger(partial.offset) && partial.offset >= 0 && partial.offset <= entry.size, '对方返回的续传位置不合法');
         assert(await fileHash(entry.source, partial.offset, t.abort.signal) === partial.hash, `已接收部分校验失败，请取消任务后重新发送：${entry.path}`);
         t.done += partial.offset; this.progress(t);
         if (partial.offset < entry.size || !partial.exists) {
-          const result = await this.request(peer.address, 'PUT', `/file/${t.remoteId}/${i}?offset=${partial.offset}`, { ...options, timeout: 0,
+          const result = await this.request(peer.address, 'PUT', `/file/${t.remoteId}/${i}?offset=${partial.offset}`, { ...options, timeout: 30000,
             stream: { source: entry.source, offset: partial.offset, size: entry.size - partial.offset }, onProgress: n => { t.done += n; this.progress(t); } });
           assert(await fileHash(entry.source, undefined, t.abort.signal) === result.hash, `文件校验失败，请取消任务后重新发送：${entry.path}`);
         }
