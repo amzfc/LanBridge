@@ -67,6 +67,16 @@ function uniquePath(folder, name) {
   while (fs.existsSync(out)) out = path.join(folder, `${parsed.name} (${index++})${parsed.ext}`);
   return out;
 }
+async function fileHash(file, size, signal) {
+  const h = crypto.createHash('sha256');
+  if (signal?.aborted) throw new Error('已取消');
+  if (size === 0) return h.digest('hex');
+  for await (const chunk of fs.createReadStream(file, size === undefined ? {} : { end: size - 1 })) {
+    if (signal?.aborted) throw new Error('已取消');
+    h.update(chunk);
+  }
+  return h.digest('hex');
+}
 async function listItems(selected) {
   assert(Array.isArray(selected) && selected.length > 0 && selected.length <= 100, '请先选择文件或文件夹');
   const entries = []; const used = new Set(); let total = 0;
@@ -115,7 +125,7 @@ class LanBridge {
   constructor({ dataDir, downloadDir, name = os.hostname(), onChange = () => {}, port = PORT }) {
     this.dataDir = dataDir; this.downloadDir = downloadDir; this.name = String(name).slice(0, 60); this.onChange = onChange; this.port = port;
     this.peers = []; this.incomingPairs = new Map(); this.outgoingPairs = new Map();
-    this.incoming = new Map(); this.outgoing = new Map(); this.attempts = new Map(); this.events = [];
+    this.routes = new Set(); this.incoming = new Map(); this.outgoing = new Map(); this.attempts = new Map(); this.events = [];
     this.pairCode = String(crypto.randomInt(100000, 1000000)); this.pairExpires = Date.now() + 10 * 60000;
   }
   emit() { this.onChange(this.snapshot()); }
@@ -130,6 +140,15 @@ class LanBridge {
       events: this.events.slice(-30) };
   }
   event(text) { this.events.push({ at: Date.now(), text }); if (this.events.length > 30) this.events.shift(); this.emit(); }
+  persist() {
+    const rows = [...this.incoming.values(), ...this.outgoing.values()].map(t => {
+      const { abort, active, busy, finishing, lastEmit, ...row } = t;
+      return { ...row, received: t.received ? [...t.received] : undefined };
+    });
+    const target = path.join(this.dataDir, 'transfers.json');
+    fs.writeFileSync(`${target}.tmp`, JSON.stringify(rows), { mode: 0o600 });
+    fs.renameSync(`${target}.tmp`, target);
+  }
   async init() {
     await fsp.mkdir(this.dataDir, { recursive: true, mode: 0o700 });
     await fsp.mkdir(this.downloadDir, { recursive: true });
@@ -145,13 +164,36 @@ class LanBridge {
     this.fingerprint = hash(new crypto.X509Certificate(this.cert).raw);
     try { this.peers = JSON.parse(await fsp.readFile(path.join(this.dataDir, 'peers.json'), 'utf8')); }
     catch { this.peers = []; }
-    this.server = https.createServer({ key: this.key, cert: this.cert, requestCert: true, rejectUnauthorized: false, minVersion: 'TLSv1.2' }, (req, res) => this.route(req, res).catch(err => send(res, 400, { error: err.message })));
+    try {
+      const rows = JSON.parse(await fsp.readFile(path.join(this.dataDir, 'transfers.json'), 'utf8'));
+      for (const t of rows) {
+        if (t.direction === 'in') {
+          t.received = new Set(t.received || []);
+          if (t.final && fs.existsSync(t.final) && !fs.existsSync(t.temp)) { t.status = 'complete'; t.destination = t.final; t.done = t.total; }
+          if (t.status === 'receiving') t.status = 'paused';
+          this.incoming.set(t.id, t);
+        } else {
+          if (['sending', 'offering', 'waiting'].includes(t.status)) t.status = 'paused';
+          this.outgoing.set(t.id, t);
+        }
+      }
+    } catch (e) { if (e.code !== 'ENOENT') throw new Error(`无法读取续传记录：${e.message}`); }
+    this.server = https.createServer({ key: this.key, cert: this.cert, requestCert: true, rejectUnauthorized: false, minVersion: 'TLSv1.2' }, (req, res) => {
+      const task = this.route(req, res).catch(err => send(res, 400, { error: err.message }));
+      this.routes.add(task); task.finally(() => this.routes.delete(task));
+    });
     this.server.requestTimeout = 0; this.server.headersTimeout = 60000;
     await new Promise((resolve, reject) => this.server.once('error', reject).listen(this.port, '0.0.0.0', resolve));
     this.port = this.server.address().port;
     this.emit();
   }
-  async close() { for (const t of this.outgoing.values()) t.abort?.abort(); await new Promise(resolve => this.server.close(resolve)); }
+  async close() {
+    for (const t of this.outgoing.values()) if (t.busy) this.pause(t.id);
+    for (const t of this.incoming.values()) t.active?.destroy();
+    await Promise.allSettled([...this.outgoing.values()].map(t => t.active).filter(Boolean));
+    await new Promise(resolve => { this.server.close(resolve); this.server.closeAllConnections(); });
+    await Promise.allSettled([...this.routes]); this.persist();
+  }
   async savePeers() { await fsp.writeFile(path.join(this.dataDir, 'peers.json'), JSON.stringify(this.peers), { mode: 0o600 }); this.emit(); }
   remember(peer) {
     assert(peer && /^[0-9a-f]{64}$/.test(peer.id), '设备身份不合法');
@@ -164,12 +206,15 @@ class LanBridge {
     const { host, port } = parseAddress(address);
     return new Promise((resolve, reject) => {
       let done = false; let buffers = []; let length = 0;
-      const req = https.request({ host, port, method, path: url, key: this.key, cert: this.cert, rejectUnauthorized: false, minVersion: 'TLSv1.2', agent: false, timeout,
+      const req = https.request({ host, port, method, path: url, key: this.key, cert: this.cert, rejectUnauthorized: false, minVersion: 'TLSv1.2', agent: false, timeout: timeout || 15000,
         headers: data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(JSON.stringify(data)) } : stream ? { 'Content-Type': 'application/octet-stream', 'Content-Length': stream.size } : {} }, res => {
+        res.on('aborted', () => req.destroy(new Error('响应中断')));
+        res.on('error', e => req.destroy(e));
         res.on('data', b => { length += b.length; if (length > MAX_JSON) req.destroy(new Error('响应过大')); else buffers.push(b); });
         res.on('end', () => { if (done) return; done = true; try { const obj = JSON.parse(Buffer.concat(buffers).toString() || '{}'); if (res.statusCode >= 400) reject(new Error(obj.error || `HTTP ${res.statusCode}`)); else resolve(obj); } catch { reject(new Error('响应格式错误')); } });
       });
       req.on('socket', socket => socket.on('secureConnect', () => {
+        req.setTimeout(timeout);
         const found = peerFingerprint(socket);
         if (!found || pin && found !== pin) req.destroy(new Error('对方设备身份与配对记录不一致'));
       }));
@@ -177,11 +222,16 @@ class LanBridge {
       req.on('error', e => { if (!done) { done = true; reject(e); } });
       if (signal) {
         if (signal.aborted) req.destroy(new Error('已取消'));
-        else signal.addEventListener('abort', () => req.destroy(new Error('已取消')), { once: true });
+        else {
+          const abort = () => req.destroy(new Error('已取消'));
+          signal.addEventListener('abort', abort, { once: true });
+          req.on('close', () => signal.removeEventListener('abort', abort));
+        }
       }
       if (data) req.end(JSON.stringify(data));
       else if (stream) {
-        const source = fs.createReadStream(stream.source);
+        const source = fs.createReadStream(stream.source, { start: stream.offset || 0 });
+        req.on('close', () => source.destroy());
         source.on('data', b => onProgress?.(b.length));
         source.on('error', e => req.destroy(e));
         source.pipe(req);
@@ -254,50 +304,88 @@ class LanBridge {
       const data = await body(req);
       const total = validateManifest(data.entries);
       assert(typeof data.name === 'string' && data.name.length <= 160, '传输名称不合法');
+      if (data.transferId) {
+        assert(/^[a-f0-9-]{36}$/.test(data.transferId), '传输编号不合法');
+        const existing = [...this.incoming.values()].find(t => t.senderId === data.transferId && t.fingerprint === fp);
+        if (existing) return send(res, 200, { id: existing.id, resumable: true });
+      }
       const id = crypto.randomUUID();
       const peer = this.peers.find(x => x.id === fp);
-      const transfer = { id, name: data.name, peerName: peer.name, direction: 'in', status: 'waiting', total, done: 0, entries: data.entries, fingerprint: fp, created: Date.now(), received: new Set() };
-      this.incoming.set(id, transfer); this.event(`${peer.name} 想发送 ${data.name}`);
-      return send(res, 200, { id });
+      const transfer = { id, senderId: data.transferId, name: data.name, peerName: peer.name, direction: 'in', status: 'waiting', total, done: 0, entries: data.entries, fingerprint: fp, created: Date.now(), received: new Set() };
+      this.incoming.set(id, transfer); this.persist(); this.event(`${peer.name} 想发送 ${data.name}`);
+      return send(res, 200, { id, resumable: true });
     }
     const offerMatch = url.pathname.match(/^\/offer\/([a-f0-9-]{36})$/);
     if (req.method === 'GET' && offerMatch) {
       const t = this.incoming.get(offerMatch[1]); assert(t && t.fingerprint === fp, '传输不存在');
-      return send(res, 200, { status: t.status, error: t.error });
+      return send(res, 200, { status: t.status === 'waiting' && Date.now() - t.created > OFFER_TTL ? 'expired' : t.status, error: t.error });
     }
     const fileMatch = url.pathname.match(/^\/file\/([a-f0-9-]{36})\/(\d+)$/);
+    if (req.method === 'GET' && fileMatch) {
+      const t = this.incoming.get(fileMatch[1]);
+      assert(t && t.fingerprint === fp && ['receiving', 'paused'].includes(t.status), '传输尚未获准');
+      assert(!t.active, '接收端仍在处理上次传输，请稍后继续');
+      const entry = t.entries[Number(fileMatch[2])];
+      assert(entry && entry.type === 'file', '文件不在传输清单中');
+      const file = path.join(t.temp, ...safeRel(entry.path));
+      t.active = req;
+      try {
+        let offset = 0; let exists = false;
+        try { offset = (await fsp.stat(file)).size; exists = true; } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        assert(offset <= entry.size, '临时文件大小异常，请取消后重新发送');
+        t.offsets ||= {};
+        t.done += offset - (t.offsets[fileMatch[2]] || 0); t.offsets[fileMatch[2]] = offset;
+        return send(res, 200, { offset, exists, hash: await fileHash(file, offset) });
+      } finally { t.active = null; }
+    }
     if (req.method === 'PUT' && fileMatch) {
       const t = this.incoming.get(fileMatch[1]);
-      assert(t && t.fingerprint === fp && t.status === 'receiving', '传输尚未获准');
+      assert(t && t.fingerprint === fp && ['receiving', 'paused'].includes(t.status), '传输尚未获准');
+      assert(!t.active, '接收端正在写入文件');
       const i = Number(fileMatch[2]); const entry = t.entries[i];
-      assert(entry && entry.type === 'file' && !t.received.has(i), '文件不在传输清单中');
-      assert(Number(req.headers['content-length']) === entry.size, '文件大小与清单不符');
+      assert(entry && entry.type === 'file', '文件不在传输清单中');
+      const offset = Number(url.searchParams.get('offset') || 0);
+      assert(Number.isSafeInteger(offset) && offset >= 0 && offset <= entry.size, '续传位置不合法');
+      assert(Number(req.headers['content-length']) === entry.size - offset, '文件大小与清单不符');
       const filePath = path.join(t.temp, ...safeRel(entry.path));
-      await fsp.mkdir(path.dirname(filePath), { recursive: true });
-      let count = 0; const h = crypto.createHash('sha256');
-      const meter = new Transform({ transform(chunk, _, cb) { count += chunk.length; h.update(chunk); t.done += chunk.length; this.owner.progress(t); cb(null, chunk); } });
-      meter.owner = this;
+      t.active = req; t.status = 'receiving'; t.error = null;
       try {
-        await pipeline(req, meter, fs.createWriteStream(filePath, { flags: 'wx' }));
-        assert(count === entry.size, '文件接收不完整');
-        t.received.add(i); this.emit();
-        return send(res, 200, { hash: h.digest('hex') });
-      } catch (e) { t.status = 'failed'; t.error = e.message; this.emit(); throw e; }
+        await fsp.mkdir(path.dirname(filePath), { recursive: true });
+        if (offset) assert((await fsp.stat(filePath)).size === offset, '续传位置已变化，请重试');
+        let count = 0;
+        const meter = new Transform({ transform(chunk, _, cb) { count += chunk.length; if (count > entry.size - offset) return cb(new Error('文件大小超出清单')); t.done += chunk.length; t.offsets ||= {}; t.offsets[i] = offset + count; this.owner.progress(t); cb(null, chunk); } });
+        meter.owner = this;
+        await pipeline(req, meter, fs.createWriteStream(filePath, { flags: offset ? 'r+' : 'w', start: offset }));
+        assert(count === entry.size - offset, '文件接收不完整');
+        t.received.add(i);
+        return send(res, 200, { hash: await fileHash(filePath) });
+      } catch (e) { if (t.status !== 'cancelled') { t.status = 'paused'; t.error = '连接中断，等待发送端继续'; } throw e; }
+      finally { t.active = null; this.persist(); this.emit(); }
     }
     const finishMatch = url.pathname.match(/^\/finish\/([a-f0-9-]{36})$/);
     if (req.method === 'POST' && finishMatch) {
       const t = this.incoming.get(finishMatch[1]);
-      assert(t && t.fingerprint === fp && t.status === 'receiving', '传输状态不正确');
-      assert(t.entries.filter(x => x.type === 'file').length === t.received.size, '仍有文件未收到');
-      const final = uniquePath(this.downloadDir, `邻传 ${new Date().toISOString().replace(/[:.]/g, '-')} ${t.id.slice(0, 8)}`);
-      await fsp.rename(t.temp, final);
-      t.destination = final; t.status = 'complete'; this.event(`已接收 ${t.name}`);
-      return send(res, 200, { ok: true });
+      assert(t && t.fingerprint === fp && ['receiving', 'paused', 'complete'].includes(t.status), '传输状态不正确');
+      if (t.status === 'complete') return send(res, 200, { ok: true });
+      assert(!t.active, '接收端正在写入文件');
+      t.finishing = true;
+      try {
+        for (const entry of t.entries.filter(x => x.type === 'file')) assert((await fsp.stat(path.join(t.temp, ...safeRel(entry.path)))).size === entry.size, '仍有文件未收到');
+        const final = t.final || uniquePath(path.dirname(t.temp), `邻传 ${new Date().toISOString().replace(/[:.]/g, '-')} ${t.id.slice(0, 8)}`);
+        t.final = final; this.persist();
+        await fsp.rename(t.temp, final);
+        t.destination = final; t.done = t.total; t.status = 'complete'; this.persist(); this.event(`已接收 ${t.name}`);
+        return send(res, 200, { ok: true });
+      } finally { t.finishing = false; }
     }
     const cancelMatch = url.pathname.match(/^\/cancel\/([a-f0-9-]{36})$/);
     if (req.method === 'POST' && cancelMatch) {
       const t = this.incoming.get(cancelMatch[1]); assert(t && t.fingerprint === fp, '传输不存在');
-      t.status = 'cancelled'; if (t.temp) await fsp.rm(t.temp, { recursive: true, force: true }); this.emit(); return send(res, 200, { ok: true });
+      assert(!t.finishing, '正在保存接收结果，请稍后重试');
+      assert(t.status !== 'complete', '已完成的传输不能取消');
+      t.status = 'cancelled'; t.active?.destroy();
+      if (t.temp) await fsp.rm(t.temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      this.persist(); this.emit(); return send(res, 200, { ok: true });
     }
     return send(res, 404, { error: '没有这个请求' });
   }
@@ -309,50 +397,97 @@ class LanBridge {
       for (const entry of t.entries.filter(x => x.type === 'directory')) await fsp.mkdir(path.join(t.temp, ...safeRel(entry.path)), { recursive: true });
       t.status = 'receiving';
     } else t.status = 'rejected';
-    this.emit();
+    this.persist(); this.emit();
   }
   async sendFiles(peerId, selected) {
     const peer = this.peers.find(x => x.id === peerId);
     assert(peer, '请先配对设备');
     const { entries, total } = await listItems(selected);
-    const label = entries.filter(x => !x.path.includes('/')).map(x => x.path).join('、').slice(0, 160);
-    const t = { id: crypto.randomUUID(), name: label, direction: 'out', peerName: peer.name, status: 'offering', total, done: 0, abort: new AbortController() };
-    this.outgoing.set(t.id, t); this.emit();
-    let remoteId;
+    const name = entries.filter(x => !x.path.includes('/')).map(x => x.path).join('、').slice(0, 160);
+    const t = { id: crypto.randomUUID(), name, direction: 'out', peerId, peerName: peer.name, entries, status: 'offering', total, done: 0 };
+    this.outgoing.set(t.id, t); this.persist();
+    return this.resume(t.id);
+  }
+  async resume(id) {
+    const t = this.outgoing.get(id);
+    assert(t && !t.busy && !['complete', 'cancelled'].includes(t.status), '当前任务不能继续');
+    t.busy = true; t.pauseRequested = false; t.cancelRequested = false;
+    t.abort = new AbortController(); t.error = null;
+    t.active = this.runTransfer(t);
+    try { await t.active; } finally { t.busy = false; t.active = null; this.persist(); this.emit(); }
+    return id;
+  }
+  async runTransfer(t) {
+    const peer = this.peers.find(x => x.id === t.peerId);
     try {
-      const offer = await this.request(peer.address, 'POST', '/offer', { pin: peer.id, data: { name: label, entries: entries.map(({ path, type, size }) => ({ path, type, size })) } });
-      remoteId = offer.id; t.status = 'waiting'; this.emit();
+      assert(peer, '对方设备已取消信任，请重新配对');
+      // Validate every source before resuming, including files already sent.
+      for (const entry of t.entries.filter(x => x.type === 'file')) {
+        const now = await fsp.lstat(entry.source);
+        assert(now.isFile() && now.size === entry.size && now.mtimeMs === entry.mtimeMs, `源文件已变化，请取消任务后重新发送：${entry.path}`);
+      }
+      const options = { pin: peer.id, signal: t.abort.signal };
+      if (!t.remoteId) {
+        t.status = 'offering'; this.emit();
+        const offer = await this.request(peer.address, 'POST', '/offer', { ...options, data: { transferId: t.id, name: t.name, entries: t.entries.map(({ path, type, size }) => ({ path, type, size })) } });
+        t.remoteId = offer.id; t.resumable = offer.resumable; this.persist();
+      }
+      assert(t.resumable, '断点续传需要两台电脑都升级到新版邻传');
+      t.status = 'waiting'; this.emit();
       for (;;) {
         if (t.abort.signal.aborted) throw new Error('已取消');
-        await new Promise(r => setTimeout(r, 1200));
-        const state = await this.request(peer.address, 'GET', `/offer/${remoteId}`, { pin: peer.id });
-        if (state.status === 'receiving') break;
-        if (state.status !== 'waiting') throw new Error(state.error || '对方拒绝了传输');
+        const state = await this.request(peer.address, 'GET', `/offer/${t.remoteId}`, options);
+        if (state.status === 'complete') { t.done = t.total; t.status = 'complete'; this.persist(); this.emit(); return; }
+        if (['receiving', 'paused'].includes(state.status)) break;
+        assert(state.status === 'waiting', state.error || '对方拒绝、取消了传输，或请求已过期');
+        await new Promise(r => setTimeout(r, 500));
       }
-      t.status = 'sending'; this.emit();
-      for (const [i, entry] of entries.entries()) {
+      t.status = 'sending'; t.done = 0; this.emit();
+      for (const [i, entry] of t.entries.entries()) {
         if (entry.type !== 'file') continue;
         if (t.abort.signal.aborted) throw new Error('已取消');
+        const partial = await this.request(peer.address, 'GET', `/file/${t.remoteId}/${i}`, { ...options, timeout: 0 });
+        assert(Number.isSafeInteger(partial.offset) && partial.offset >= 0 && partial.offset <= entry.size, '对方返回的续传位置不合法');
+        assert(await fileHash(entry.source, partial.offset, t.abort.signal) === partial.hash, `已接收部分校验失败，请取消任务后重新发送：${entry.path}`);
+        t.done += partial.offset; this.progress(t);
+        if (partial.offset < entry.size || !partial.exists) {
+          const result = await this.request(peer.address, 'PUT', `/file/${t.remoteId}/${i}?offset=${partial.offset}`, { ...options, timeout: 0,
+            stream: { source: entry.source, offset: partial.offset, size: entry.size - partial.offset }, onProgress: n => { t.done += n; this.progress(t); } });
+          assert(await fileHash(entry.source, undefined, t.abort.signal) === result.hash, `文件校验失败，请取消任务后重新发送：${entry.path}`);
+        }
         const now = await fsp.stat(entry.source);
         assert(now.size === entry.size && now.mtimeMs === entry.mtimeMs, `发送期间文件发生变化：${entry.path}`);
-        const h = crypto.createHash('sha256');
-        const result = await this.request(peer.address, 'PUT', `/file/${remoteId}/${i}`, { pin: peer.id, timeout: 0, signal: t.abort.signal,
-          stream: { source: entry.source, size: entry.size }, onProgress: n => { t.done += n; this.progress(t); } });
-        const verify = await new Promise((resolve, reject) => {
-          const s = fs.createReadStream(entry.source);
-          s.on('data', b => h.update(b)); s.on('end', () => resolve(h.digest('hex'))); s.on('error', reject);
-        });
-        assert(verify === result.hash, `文件校验失败：${entry.path}`);
       }
-      await this.request(peer.address, 'POST', `/finish/${remoteId}`, { pin: peer.id, data: {}, timeout: 30000 });
-      t.status = 'complete'; this.event(`已发送 ${label}`);
+      await this.request(peer.address, 'POST', `/finish/${t.remoteId}`, { ...options, data: {}, timeout: 30000 });
+      t.done = t.total; t.status = 'complete'; this.event(`已发送 ${t.name}`);
     } catch (e) {
-      if (remoteId) this.request(peer.address, 'POST', `/cancel/${remoteId}`, { pin: peer.id, data: {} }).catch(() => {});
-      t.status = e.message === '已取消' ? 'cancelled' : 'failed'; t.error = e.message; this.emit();
+      t.status = t.cancelRequested ? 'cancelled' : 'paused';
+      t.error = t.pauseRequested ? null : e.message;
+      if (t.cancelRequested && t.remoteId && peer) {
+        try { await this.request(peer.address, 'POST', `/cancel/${t.remoteId}`, { pin: peer.id, data: {} }); }
+        catch { t.status = 'paused'; t.error = '未能通知接收端取消，连接恢复后请再次取消'; }
+      }
     }
-    return t.id;
+    this.persist(); this.emit();
   }
-  cancel(id) { const t = this.outgoing.get(id); if (t) t.abort.abort(); }
+  pause(id) {
+    const t = this.outgoing.get(id);
+    assert(t && t.busy, '当前任务不能暂停');
+    t.pauseRequested = true; t.abort.abort();
+  }
+  async cancel(id) {
+    const t = this.outgoing.get(id);
+    assert(t && t.status !== 'complete', '当前任务不能取消');
+    if (t.busy) { t.cancelRequested = true; t.abort.abort(); await t.active; }
+    else {
+      const peer = this.peers.find(x => x.id === t.peerId);
+      if (t.remoteId) {
+        assert(peer, '请重新配对对方设备后取消，以清理接收端临时文件');
+        await this.request(peer.address, 'POST', `/cancel/${t.remoteId}`, { pin: peer.id, data: {} });
+      }
+      t.status = 'cancelled'; t.error = null; this.persist(); this.emit();
+    }
+  }
   async setPeerAddress(id, address) {
     const peer = this.peers.find(x => x.id === id);
     assert(peer, '找不到该设备');

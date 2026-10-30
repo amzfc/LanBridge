@@ -10,7 +10,7 @@ function button(text, cls, fn) { const b = node('button', cls, text); b.onclick 
 function item(title, subtitle) { const box = node('div', 'item'); const main = node('div', 'item-main'); main.append(node('strong', '', title), node('small', '', subtitle)); const actions = node('div', 'item-actions'); box.append(main, actions); return { box, main, actions }; }
 function fill(element, nodes, empty) { element.replaceChildren(...nodes); element.classList.toggle('empty', nodes.length === 0); if (!nodes.length) element.textContent = empty; }
 function prettyBytes(n) { if (!n) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; const i = Math.min(4, Math.floor(Math.log(n) / Math.log(1024))); return `${(n / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`; }
-const labels = { waiting: '等待确认', approved: '已获对方确认', rejected: '已拒绝', expired: '已过期', offering: '发送请求中', receiving: '接收中', sending: '发送中', complete: '已完成', failed: '失败', cancelled: '已取消' };
+const labels = { waiting: '等待确认', approved: '已获对方确认', rejected: '已拒绝', expired: '已过期', offering: '发送请求中', receiving: '接收中', sending: '发送中', complete: '已完成', failed: '失败', paused: '已暂停，可继续', cancelled: '已取消' };
 function render(s) {
   state = s;
   $('#pair-code').textContent = s.pairCode;
@@ -51,7 +51,11 @@ function render(s) {
     else {
       if (t.status === 'sending' || t.status === 'receiving') { const bar = node('div', 'progress'); const fill = node('i'); fill.style.width = `${t.total ? Math.min(100, Math.round(t.done / t.total * 100)) : 100}%`; bar.append(fill); row.actions.append(bar); }
       row.actions.append(node('span', `pill ${t.status === 'complete' ? 'ok' : t.status === 'failed' || t.status === 'cancelled' ? 'bad' : ''}`, labels[t.status] || t.status));
-      if (t.direction === 'out' && ['offering', 'waiting', 'sending'].includes(t.status)) row.actions.append(button('取消', 'text-button danger', () => window.lan.cancel(t.id)));
+      if (t.direction === 'out') {
+        if (['offering', 'waiting', 'sending'].includes(t.status)) row.actions.append(button('暂停', 'text-button', () => window.lan.pause(t.id)));
+        if (t.status === 'paused') row.actions.append(button('继续', 'primary', () => window.lan.resume(t.id)));
+        if (['offering', 'waiting', 'sending', 'paused'].includes(t.status)) row.actions.append(button('取消', 'text-button danger', () => window.lan.cancel(t.id)));
+      }
     }
     return row.box;
   });

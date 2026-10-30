@@ -37,6 +37,8 @@ app.whenReady().then(async () => {
   handle('send-files', (id, files) => bridge.sendFiles(id, files));
   handle('decide-offer', (id, approve) => bridge.decideOffer(id, approve));
   handle('cancel', id => bridge.cancel(id));
+  handle('pause', id => bridge.pause(id));
+  handle('resume', id => bridge.resume(id));
   handle('choose-download-dir', async () => {
     const selection = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
     if (selection.canceled) return bridge.downloadDir;
@@ -48,3 +50,10 @@ app.whenReady().then(async () => {
   createWindow();
 });
 app.on('window-all-closed', () => app.quit());
+
+let closing = false;
+app.on('before-quit', event => {
+  if (!bridge?.server || closing) return;
+  event.preventDefault(); closing = true;
+  bridge.close().finally(() => app.quit());
+});

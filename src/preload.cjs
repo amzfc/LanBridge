@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('lan', {
   sendFiles: (id, files) => invoke('send-files', id, files),
   decideOffer: (id, approve) => invoke('decide-offer', id, approve),
   cancel: id => invoke('cancel', id),
+  pause: id => invoke('pause', id),
+  resume: id => invoke('resume', id),
   chooseDownloadDir: () => invoke('choose-download-dir'),
   openDownloadDir: () => invoke('open-download-dir'),
   pathsForFiles: files => Array.from(files).map(file => webUtils.getPathForFile(file)).filter(Boolean)
